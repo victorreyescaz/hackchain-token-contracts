@@ -14,9 +14,13 @@ import { ReentrancyGuard } from "@openzeppelin/contracts/utils/ReentrancyGuard.s
  * y la transfiere a la pool de tesorería.
  *
  * Diseñado para ser llamado por otros contratos "transaccionales" (p.ej. un
- * futuro CertificateSystem o el contrato del Mecanismo 12 de pago
- * Educador-Talento), no por el usuario final directamente. Sigue el
- * mismo patrón de roles que IncentivesPool.sol.
+ * futuro CertificateSystem), no por el usuario final directamente. Sigue el
+ * mismo patrón de roles que IncentivesPool.sol. Las clases 1 a 1 del
+ * Mecanismo 12 no llevan comisión, y su pago va fuera de la cadena.
+ *
+ * HC-SRC-005 fix: consulta StakingContract.hasNoCommission() sobre el
+ * pagador. Si tiene el beneficio, no paga la comisión, transfiere solo el
+ * neto, y el beneficiario recibe lo mismo que recibiría sin la exención.
  */
 contract CommissionSystem is AccessControl, ReentrancyGuard {
     // --- Roles ---
@@ -32,6 +36,9 @@ contract CommissionSystem is AccessControl, ReentrancyGuard {
 
     /// @notice Dirección de la pool de tesorería (recibe las comisiones).
     address public treasury;
+
+    /// @notice Fuente de la exención de comisión (Mecanismo 6, HC-SRC-005).
+    IStakingContract public stakingContract;
 
     /// @notice Comisión en puntos básicos (5% = 500 bps). Ajustable por el admin.
     uint256 public commissionBps = 500;
@@ -70,6 +77,13 @@ contract CommissionSystem is AccessControl, ReentrancyGuard {
     /// @dev Emitido cuando el admin actualiza la dirección de tesorería.
     event TreasuryUpdated(address indexed oldTreasury, address indexed newTreasury);
 
+    /// @dev Emitido junto a CommissionCollected cuando el pagador tiene la
+    /// exención. waivedAmount es la comisión que habría pagado.
+    event CommissionWaived(bytes32 indexed evidenceId, address indexed payer, uint256 waivedAmount);
+
+    /// @dev Emitido cuando el admin actualiza la fuente de la exención.
+    event StakingContractUpdated(address indexed oldStaking, address indexed newStaking);
+
     // --- Constructor ---
 
     /**
@@ -77,13 +91,16 @@ contract CommissionSystem is AccessControl, ReentrancyGuard {
      * El deployer recibe DEFAULT_ADMIN_ROLE para gestionar roles y parámetros.
      * @param hackToken_ Dirección del token HACK.
      * @param treasury_ Dirección de la pool de tesorería.
+     * @param stakingContract_ StakingContract, fuente de la exención de comisión.
      */
-    constructor(address hackToken_, address treasury_) {
+    constructor(address hackToken_, address treasury_, address stakingContract_) {
         if (hackToken_ == address(0)) revert InvalidAddress();
         if (treasury_ == address(0)) revert InvalidAddress();
+        if (stakingContract_ == address(0)) revert InvalidAddress();
 
         hackToken = IERC20(hackToken_);
         treasury = treasury_;
+        stakingContract = IStakingContract(stakingContract_);
 
         _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
     }
@@ -102,6 +119,8 @@ contract CommissionSystem is AccessControl, ReentrancyGuard {
      * @param grossAmount_ Monto bruto de la transacción, en HACK.
      * @param reason_ Descripción legible de la transacción (p.ej. "certificate_emission").
      * @return netAmount Monto neto transferido al beneficiario tras descontar la comisión.
+     * Es el mismo tenga o no el pagador la exención: con exención el pagador
+     * transfiere solo el neto, sin comisión (HC-SRC-005).
      */
     function collectCommission(
         bytes32 evidenceId_,
@@ -119,6 +138,17 @@ contract CommissionSystem is AccessControl, ReentrancyGuard {
 
         uint256 commissionAmount = (grossAmount_ * commissionBps) / BPS_DENOMINATOR;
         netAmount = grossAmount_ - commissionAmount;
+
+        if (stakingContract.hasNoCommission(payer_)) {
+            // El pagador con exención no paga la comisión. El beneficiario
+            // recibe el mismo neto que sin exención.
+            bool successWaived = hackToken.transferFrom(payer_, payee_, netAmount);
+            if (!successWaived) revert TransferFailed();
+
+            emit CommissionCollected(evidenceId_, payer_, grossAmount_, 0, reason_);
+            emit CommissionWaived(evidenceId_, payer_, commissionAmount);
+            return netAmount;
+        }
 
         totalCommissionsCollected += commissionAmount;
 
@@ -158,6 +188,17 @@ contract CommissionSystem is AccessControl, ReentrancyGuard {
         emit TreasuryUpdated(old, newTreasury_);
     }
 
+    /**
+     * @notice Actualiza la fuente de la exención de comisión.
+     * @param newStaking_ Nueva dirección de StakingContract.
+     */
+    function setStakingContract(address newStaking_) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (newStaking_ == address(0)) revert InvalidAddress();
+        address old = address(stakingContract);
+        stakingContract = IStakingContract(newStaking_);
+        emit StakingContractUpdated(old, newStaking_);
+    }
+
     // --- Views ---
 
     /**
@@ -174,4 +215,32 @@ contract CommissionSystem is AccessControl, ReentrancyGuard {
         commissionAmount = (grossAmount_ * commissionBps) / BPS_DENOMINATOR;
         netAmount = grossAmount_ - commissionAmount;
     }
+
+    /**
+     * @notice Calcula lo que pagaría un pagador concreto, teniendo en cuenta
+     * su exención (HC-SRC-005).
+     * @dev previewCommission() no sabe quién paga y no puede reflejarla.
+     * @param payer_ Dirección que pagaría la transacción.
+     * @param grossAmount_ Monto bruto de la transacción.
+     * @return commissionAmount Comisión que pagaría (cero con exención).
+     * @return payerPays Lo que transferiría el pagador.
+     * @return payeeReceives Lo que recibiría el beneficiario.
+     */
+    function previewCommissionFor(address payer_, uint256 grossAmount_)
+        external
+        view
+        returns (uint256 commissionAmount, uint256 payerPays, uint256 payeeReceives)
+    {
+        uint256 fee = (grossAmount_ * commissionBps) / BPS_DENOMINATOR;
+        payeeReceives = grossAmount_ - fee;
+
+        if (stakingContract.hasNoCommission(payer_)) {
+            return (0, payeeReceives, payeeReceives);
+        }
+        return (fee, grossAmount_, payeeReceives);
+    }
+}
+
+interface IStakingContract {
+    function hasNoCommission(address user_) external view returns (bool);
 }
